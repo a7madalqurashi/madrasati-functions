@@ -114,6 +114,31 @@ async function callClaude(anthropic, prompt, retryNote) {
   return toolUse.input.questions;
 }
 
+function generateJoinCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+async function verifyAuth(req, res) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) {
+    res.status(401).json({ error: 'Missing auth token.' });
+    return null;
+  }
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    return decoded.uid;
+  } catch (e) {
+    res.status(401).json({ error: 'Invalid auth token.' });
+    return null;
+  }
+}
+
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json());
@@ -123,21 +148,8 @@ app.get('/', (req, res) => {
 });
 
 app.post('/generateQuestions', async (req, res) => {
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  if (!token) {
-    res.status(401).json({ error: 'Missing auth token.' });
-    return;
-  }
-
-  let uid;
-  try {
-    const decoded = await admin.auth().verifyIdToken(token);
-    uid = decoded.uid;
-  } catch (e) {
-    res.status(401).json({ error: 'Invalid auth token.' });
-    return;
-  }
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
 
   const examId = req.body && req.body.examId;
   if (!examId) {
@@ -223,6 +235,186 @@ app.post('/generateQuestions', async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     res.status(500).json({ error: 'Question generation failed.', details: String(error.message || error) });
+  }
+});
+
+app.post('/publishExam', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const examId = req.body && req.body.examId;
+  if (!examId) {
+    res.status(400).json({ error: 'examId is required.' });
+    return;
+  }
+
+  const examRef = db.collection('exams').doc(examId);
+  const examSnap = await examRef.get();
+  if (!examSnap.exists) {
+    res.status(404).json({ error: 'Exam not found.' });
+    return;
+  }
+  const exam = examSnap.data();
+  if (exam.teacherId !== uid) {
+    res.status(403).json({ error: 'Not the owner of this exam.' });
+    return;
+  }
+
+  const questionsSnap = await examRef.collection('questions').limit(1).get();
+  if (questionsSnap.empty) {
+    res.status(400).json({ error: 'Exam has no questions yet.' });
+    return;
+  }
+
+  let code;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const candidate = generateJoinCode();
+    const existing = await db.collection('joinCodes').doc(candidate).get();
+    if (!existing.exists) {
+      code = candidate;
+      break;
+    }
+  }
+  if (!code) {
+    res.status(500).json({ error: 'Could not generate a unique join code, try again.' });
+    return;
+  }
+
+  await db.collection('joinCodes').doc(code).set({ examId, active: true });
+  await examRef.update({
+    status: 'published',
+    joinCode: code,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  res.status(200).json({ joinCode: code });
+});
+
+app.post('/startExamAttempt', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const joinCode = (req.body && req.body.joinCode || '').toUpperCase().trim();
+  const displayName = (req.body && req.body.displayName || '').trim();
+  if (!joinCode) {
+    res.status(400).json({ error: 'joinCode is required.' });
+    return;
+  }
+
+  const codeSnap = await db.collection('joinCodes').doc(joinCode).get();
+  if (!codeSnap.exists || !codeSnap.data().active) {
+    res.status(404).json({ error: 'Invalid or inactive join code.' });
+    return;
+  }
+  const examId = codeSnap.data().examId;
+  const examRef = db.collection('exams').doc(examId);
+  const examSnap = await examRef.get();
+  if (!examSnap.exists || examSnap.data().status !== 'published') {
+    res.status(404).json({ error: 'This exam is not available.' });
+    return;
+  }
+  const exam = examSnap.data();
+
+  const attemptsAllowed = (exam.settings && exam.settings.attemptsAllowed) || 1;
+  const priorAttempts = await examRef
+    .collection('attempts')
+    .where('studentUid', '==', uid)
+    .get();
+  if (priorAttempts.size >= attemptsAllowed) {
+    res.status(403).json({ error: 'You have no attempts left for this exam.' });
+    return;
+  }
+
+  const questionsSnap = await examRef.collection('questions').orderBy('order').get();
+  const questions = questionsSnap.docs.map((d) => {
+    const q = d.data();
+    return {
+      id: d.id,
+      type: q.type,
+      text: q.text,
+      options: q.options || null,
+      points: q.points || 1,
+    };
+  });
+
+  const attemptRef = await examRef.collection('attempts').add({
+    studentUid: uid,
+    studentDisplayName: displayName,
+    status: 'in_progress',
+    answers: {},
+    startedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  res.status(200).json({
+    attemptId: attemptRef.id,
+    examId,
+    examTitle: exam.title,
+    subject: exam.subject,
+    teacherWhatsApp: exam.teacherWhatsApp || null,
+    timeLimitMinutes: (exam.settings && exam.settings.timeLimitMinutes) || null,
+    questions,
+  });
+});
+
+app.post('/submitExamAttempt', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const examId = req.body && req.body.examId;
+  const attemptId = req.body && req.body.attemptId;
+  const answers = (req.body && req.body.answers) || {};
+  if (!examId || !attemptId) {
+    res.status(400).json({ error: 'examId and attemptId are required.' });
+    return;
+  }
+
+  const examRef = db.collection('exams').doc(examId);
+  const attemptRef = examRef.collection('attempts').doc(attemptId);
+
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const attemptSnap = await tx.get(attemptRef);
+      if (!attemptSnap.exists) {
+        throw { httpStatus: 404, message: 'Attempt not found.' };
+      }
+      const attempt = attemptSnap.data();
+      if (attempt.studentUid !== uid) {
+        throw { httpStatus: 403, message: 'Not your attempt.' };
+      }
+      if (attempt.status === 'submitted') {
+        // Already graded — immutable. Return the existing score instead of
+        // re-grading, so a duplicate submit can never change the result.
+        return { score: attempt.score, totalPoints: attempt.totalPoints, alreadySubmitted: true };
+      }
+
+      const questionsSnap = await tx.get(examRef.collection('questions'));
+      let score = 0;
+      let totalPoints = 0;
+      questionsSnap.docs.forEach((qDoc) => {
+        const q = qDoc.data();
+        const points = q.points || 1;
+        totalPoints += points;
+        const studentAnswer = answers[qDoc.id];
+        if (studentAnswer !== undefined && studentAnswer === q.correctAnswer) {
+          score += points;
+        }
+      });
+
+      tx.update(attemptRef, {
+        answers,
+        score,
+        totalPoints,
+        status: 'submitted',
+        submittedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return { score, totalPoints, alreadySubmitted: false };
+    });
+
+    res.status(200).json(result);
+  } catch (error) {
+    const status = error.httpStatus || 500;
+    res.status(status).json({ error: error.message || 'Submission failed.' });
   }
 });
 
