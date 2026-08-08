@@ -631,6 +631,103 @@ app.post('/searchTeachers', async (req, res) => {
   res.status(200).json({ teachers: teachers.slice(0, 20) });
 });
 
+app.post('/sendFriendRequest', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const toUid = ((req.body && req.body.toUid) || '').trim();
+  if (!toUid || toUid === uid) {
+    res.status(400).json({ error: 'Invalid recipient.' });
+    return;
+  }
+
+  const [fromDoc, toDoc] = await Promise.all([
+    db.collection('users').doc(uid).get(),
+    db.collection('users').doc(toUid).get(),
+  ]);
+  if (!toDoc.exists) {
+    res.status(404).json({ error: 'User not found.' });
+    return;
+  }
+
+  const fromData = fromDoc.data() || {};
+  const toData = toDoc.data();
+  const fromName = [fromData.firstName, fromData.fatherName, fromData.lastName].filter(Boolean).join(' ');
+  const toName = [toData.firstName, toData.fatherName, toData.lastName].filter(Boolean).join(' ');
+
+  if ((fromData.friendUids || []).includes(toUid)) {
+    res.status(200).json({ status: 'already_friends' });
+    return;
+  }
+
+  const reverseId = `${toUid}_${uid}`;
+  const reverseDoc = await db.collection('friendRequests').doc(reverseId).get();
+  if (reverseDoc.exists && reverseDoc.data().status === 'pending') {
+    await db.runTransaction(async (tx) => {
+      tx.update(db.collection('users').doc(uid), {
+        friendUids: admin.firestore.FieldValue.arrayUnion(toUid),
+        [`friendNames.${toUid}`]: toName,
+      });
+      tx.update(db.collection('users').doc(toUid), {
+        friendUids: admin.firestore.FieldValue.arrayUnion(uid),
+        [`friendNames.${uid}`]: fromName,
+      });
+      tx.delete(db.collection('friendRequests').doc(reverseId));
+    });
+    res.status(200).json({ status: 'accepted' });
+    return;
+  }
+
+  const requestId = `${uid}_${toUid}`;
+  await db.collection('friendRequests').doc(requestId).set({
+    fromUid: uid,
+    fromName,
+    toUid,
+    toName,
+    status: 'pending',
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  res.status(200).json({ status: 'sent' });
+});
+
+app.post('/respondFriendRequest', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const requestId = ((req.body && req.body.requestId) || '').trim();
+  const accept = !!(req.body && req.body.accept);
+
+  const reqRef = db.collection('friendRequests').doc(requestId);
+  const reqDoc = await reqRef.get();
+  if (!reqDoc.exists) {
+    res.status(404).json({ error: 'Request not found.' });
+    return;
+  }
+  const data = reqDoc.data();
+  if (data.toUid !== uid) {
+    res.status(403).json({ error: 'Not authorized.' });
+    return;
+  }
+
+  if (accept) {
+    await db.runTransaction(async (tx) => {
+      tx.update(db.collection('users').doc(data.fromUid), {
+        friendUids: admin.firestore.FieldValue.arrayUnion(data.toUid),
+        [`friendNames.${data.toUid}`]: data.toName,
+      });
+      tx.update(db.collection('users').doc(data.toUid), {
+        friendUids: admin.firestore.FieldValue.arrayUnion(data.fromUid),
+        [`friendNames.${data.fromUid}`]: data.fromName,
+      });
+      tx.delete(reqRef);
+    });
+  } else {
+    await reqRef.delete();
+  }
+
+  res.status(200).json({ status: accept ? 'accepted' : 'rejected' });
+});
+
 app.post('/startExamAttempt', async (req, res) => {
   const uid = await verifyAuth(req, res);
   if (!uid) return;
