@@ -553,11 +553,13 @@ app.post('/importStudents', async (req, res) => {
 
   for (const row of rows) {
     const nationalId = String(row.nationalId || '').replace(/\D/g, '');
-    const phone = String(row.phone || '').replace(/\D/g, '');
+    const phone = String(row.phone || '').replace(/\D/g, '') || nationalId;
     const firstName = String(row.firstName || '').trim();
     const fatherName = String(row.fatherName || '').trim();
     const lastName = String(row.lastName || '').trim();
     const stage = String(row.stage || '').trim();
+    const schoolName = String(row.schoolName || '').trim();
+    const schoolNumber = String(row.schoolNumber || '').trim();
     const sectionNum = parseInt(row.section, 10);
 
     if (!nationalId || !phone || !firstName) {
@@ -587,8 +589,8 @@ app.post('/importStudents', async (req, res) => {
         lastName,
         email: '',
         phone,
-        schoolName: '',
-        schoolNumber: '',
+        schoolName,
+        schoolNumber,
         stage,
         section: isNaN(sectionNum) ? null : sectionNum,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -620,7 +622,8 @@ app.post('/searchTeachers', async (req, res) => {
     const u = doc.data();
     const name = [u.firstName, u.fatherName, u.lastName].filter(Boolean).join(' ');
     const phone = u.phone || '';
-    if (name.toLowerCase().includes(query) || phone.includes(query)) {
+    const email = (u.email || '').toLowerCase();
+    if (name.toLowerCase().includes(query) || phone.includes(query) || email.includes(query)) {
       teachers.push({ uid: doc.id, name, phone });
     }
   });
