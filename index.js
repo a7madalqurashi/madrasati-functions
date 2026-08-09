@@ -405,6 +405,146 @@ app.post('/publishExam', async (req, res) => {
   res.status(200).json({ joinCode: code });
 });
 
+async function commitInChunks(docRefsWithData) {
+  for (let i = 0; i < docRefsWithData.length; i += 450) {
+    const batch = db.batch();
+    docRefsWithData.slice(i, i + 450).forEach(({ ref, data, merge }) => {
+      batch.set(ref, data, merge ? { merge: true } : {});
+    });
+    await batch.commit();
+  }
+}
+
+// Toggles whether an already-published exam is currently joinable. Closing
+// it also permanently reveals results to every student who already
+// submitted, regardless of the per-exam showResultToStudent setting — the
+// close action is the teacher's explicit "the exam is over" signal.
+app.post('/setExamPublishStatus', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const examId = req.body && req.body.examId;
+  const publish = req.body && req.body.publish;
+  if (!examId || typeof publish !== 'boolean') {
+    res.status(400).json({ error: 'examId and publish (boolean) are required.' });
+    return;
+  }
+
+  const examRef = db.collection('exams').doc(examId);
+  const examSnap = await examRef.get();
+  if (!examSnap.exists) {
+    res.status(404).json({ error: 'Exam not found.' });
+    return;
+  }
+  const exam = examSnap.data();
+  if (exam.teacherId !== uid) {
+    res.status(403).json({ error: 'Not the owner of this exam.' });
+    return;
+  }
+  if (exam.status !== 'published' && exam.status !== 'closed') {
+    res.status(400).json({ error: 'Exam must be published before its availability can be toggled.' });
+    return;
+  }
+
+  await examRef.update({
+    status: publish ? 'published' : 'closed',
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  if (exam.joinCode) {
+    await db.collection('joinCodes').doc(exam.joinCode).set({ active: publish }, { merge: true });
+  }
+
+  let revealedCount = 0;
+  if (!publish) {
+    const attemptsSnap = await examRef.collection('attempts').where('status', '==', 'submitted').get();
+    const updates = attemptsSnap.docs.map((doc) => {
+      const attempt = doc.data();
+      revealedCount += 1;
+      return {
+        ref: db.collection('studentAttempts').doc(attempt.studentUid).collection('records').doc(doc.id),
+        data: { hidden: false, score: attempt.score, totalPoints: attempt.totalPoints },
+        merge: true,
+      };
+    });
+    await commitInChunks(updates);
+  }
+
+  res.status(200).json({ status: publish ? 'published' : 'closed', revealedCount });
+});
+
+// Detaches students from the caller's school (clears schoolNumber/stage/section)
+// without touching their account, login, or exam history — fully reversible via
+// re-import or re-entering the info from the student's profile.
+app.post('/removeStudentsFromSchool', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const callerSnap = await db.collection('users').doc(uid).get();
+  if (!callerSnap.exists || callerSnap.data().role !== 'teacher') {
+    res.status(403).json({ error: 'Only teachers can perform this action.' });
+    return;
+  }
+  const callerSchool = String(callerSnap.data().schoolNumber || '').trim();
+  if (!callerSchool) {
+    res.status(400).json({ error: 'Your account has no school number set.' });
+    return;
+  }
+
+  const scope = req.body && req.body.scope;
+  const studentUid = req.body && req.body.studentUid;
+  const stage = req.body && req.body.stage;
+  const section = req.body && req.body.section;
+
+  const clearedFields = {
+    schoolNumber: admin.firestore.FieldValue.delete(),
+    stage: admin.firestore.FieldValue.delete(),
+    section: admin.firestore.FieldValue.delete(),
+  };
+
+  if (scope === 'student') {
+    if (!studentUid) {
+      res.status(400).json({ error: 'studentUid is required.' });
+      return;
+    }
+    const targetRef = db.collection('users').doc(studentUid);
+    const targetSnap = await targetRef.get();
+    if (!targetSnap.exists || targetSnap.data().schoolNumber !== callerSchool) {
+      res.status(404).json({ error: 'Student not found in your school.' });
+      return;
+    }
+    await targetRef.update(clearedFields);
+    res.status(200).json({ removedCount: 1 });
+    return;
+  }
+
+  let query = db
+    .collection('users')
+    .where('role', '==', 'student')
+    .where('schoolNumber', '==', callerSchool);
+
+  if (scope === 'stage') {
+    if (!stage) {
+      res.status(400).json({ error: 'stage is required.' });
+      return;
+    }
+    query = query.where('stage', '==', stage);
+  } else if (scope === 'section') {
+    if (!stage || section === undefined || section === null) {
+      res.status(400).json({ error: 'stage and section are required.' });
+      return;
+    }
+    query = query.where('stage', '==', stage).where('section', '==', section);
+  } else {
+    res.status(400).json({ error: 'Invalid scope.' });
+    return;
+  }
+
+  const snap = await query.get();
+  await commitInChunks(snap.docs.map((doc) => ({ ref: doc.ref, data: clearedFields, merge: true })));
+
+  res.status(200).json({ removedCount: snap.size });
+});
+
 app.post('/examReport', async (req, res) => {
   const uid = await verifyAuth(req, res);
   if (!uid) return;
