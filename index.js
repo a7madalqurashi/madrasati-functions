@@ -929,14 +929,36 @@ app.post('/startExamAttempt', async (req, res) => {
   }
 
   const questionsSnap = await examRef.collection('questions').orderBy('order').get();
+  // For each shuffled multiple-choice question, optionOrder[questionId] holds
+  // the original index that now sits at each shuffled position — e.g. [2,0,1]
+  // means "shuffled option 0 is original option 2", etc. Stored on the
+  // attempt (server-side) so both grading and the teacher's answer review can
+  // translate a student's shuffled-position answer back to the source option.
+  const optionOrder = {};
   const questions = questionsSnap.docs.map((d) => {
     const q = d.data();
+    let options = q.options || null;
+    let optionImageUrls = q.optionImageUrls || null;
+
+    if (q.type === 'multiple_choice' && Array.isArray(options) && options.length > 1) {
+      const order = options.map((_, idx) => idx);
+      for (let i = order.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [order[i], order[j]] = [order[j], order[i]];
+      }
+      options = order.map((originalIdx) => options[originalIdx]);
+      if (Array.isArray(optionImageUrls)) {
+        optionImageUrls = order.map((originalIdx) => optionImageUrls[originalIdx] ?? null);
+      }
+      optionOrder[d.id] = order;
+    }
+
     return {
       id: d.id,
       type: q.type,
       text: q.text,
-      options: q.options || null,
-      optionImageUrls: q.optionImageUrls || null,
+      options,
+      optionImageUrls,
       points: q.points || 1,
     };
   });
@@ -953,6 +975,7 @@ app.post('/startExamAttempt', async (req, res) => {
     studentDisplayName: displayName,
     status: 'in_progress',
     answers: {},
+    optionOrder,
     startedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
@@ -1014,6 +1037,7 @@ app.post('/submitExamAttempt', async (req, res) => {
       }
 
       const questionsSnap = await tx.get(examRef.collection('questions'));
+      const optionOrder = attempt.optionOrder || {};
       let score = 0;
       let totalPoints = 0;
       questionsSnap.docs.forEach((qDoc) => {
@@ -1021,7 +1045,13 @@ app.post('/submitExamAttempt', async (req, res) => {
         const points = q.points || 1;
         totalPoints += points;
         const studentAnswer = answers[qDoc.id];
-        if (studentAnswer !== undefined && studentAnswer === q.correctAnswer) {
+        // Options were shuffled per attempt, so the correct shuffled
+        // position for this student is derived from the order stored on
+        // their attempt, not the question's original correctAnswer index
+        // (falls back to it for older attempts with no stored order).
+        const order = optionOrder[qDoc.id];
+        const correctAnswer = order ? order.indexOf(q.correctAnswer) : q.correctAnswer;
+        if (studentAnswer !== undefined && studentAnswer === correctAnswer) {
           score += points;
         }
       });
