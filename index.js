@@ -403,7 +403,71 @@ app.post('/publishExam', async (req, res) => {
   });
 
   res.status(200).json({ joinCode: code });
+
+  try {
+    let tokens = [];
+    if (exam.restrictedStudentUid) {
+      const studentSnap = await db.collection('users').doc(exam.restrictedStudentUid).get();
+      tokens = studentSnap.exists ? (studentSnap.data().fcmTokens || []) : [];
+    } else {
+      tokens = await getStudentTokens({ schoolNumber: exam.schoolNumber, stage: exam.stage });
+    }
+    await sendPushToTokens(tokens, {
+      title: 'اختبار جديد',
+      body: `تم نشر اختبار "${exam.title || exam.subject}" — انضم الآن`,
+      data: { type: 'exam_published', examId },
+    });
+  } catch (e) {
+    console.error('publishExam notification failed:', e);
+  }
 });
+
+// Sends a push notification to a list of FCM tokens, silently dropping any
+// tokens Firebase reports as no-longer-valid (uninstalled app, stale web
+// session, etc.) so they stop being retried on future sends.
+async function sendPushToTokens(tokens, { title, body, data }) {
+  const uniqueTokens = [...new Set(tokens)].filter(Boolean);
+  if (uniqueTokens.length === 0) return;
+
+  const response = await admin.messaging().sendEachForMulticast({
+    tokens: uniqueTokens,
+    notification: { title, body },
+    data: data || {},
+  });
+
+  const deadTokens = [];
+  response.responses.forEach((r, i) => {
+    if (!r.success && ['messaging/registration-token-not-registered', 'messaging/invalid-argument'].includes(r.error?.code)) {
+      deadTokens.push(uniqueTokens[i]);
+    }
+  });
+  if (deadTokens.length > 0) {
+    const usersSnap = await db.collection('users').where('fcmTokens', 'array-contains-any', deadTokens.slice(0, 10)).get();
+    await Promise.all(
+      usersSnap.docs.map((doc) =>
+        doc.ref.update({ fcmTokens: admin.firestore.FieldValue.arrayRemove(...deadTokens) })
+      )
+    );
+  }
+}
+
+// Collects the FCM tokens of every student matching a school + stage (and,
+// if given, a specific section within it) — used to notify a whole class or
+// stage about a new exam/homework without needing a dedicated audience list.
+async function getStudentTokens({ schoolNumber, stage, sections }) {
+  let query = db.collection('users')
+    .where('role', '==', 'student')
+    .where('schoolNumber', '==', schoolNumber)
+    .where('stage', '==', stage);
+  const snap = await query.get();
+  const tokens = [];
+  snap.forEach((doc) => {
+    const u = doc.data();
+    if (sections && sections.length > 0 && !sections.includes(u.section)) return;
+    if (Array.isArray(u.fcmTokens)) tokens.push(...u.fcmTokens);
+  });
+  return tokens;
+}
 
 async function commitInChunks(docRefsWithData) {
   for (let i = 0; i < docRefsWithData.length; i += 450) {
@@ -455,11 +519,13 @@ app.post('/setExamPublishStatus', async (req, res) => {
   }
 
   let revealedCount = 0;
+  let revealedStudentUids = [];
   if (!publish) {
     const attemptsSnap = await examRef.collection('attempts').where('status', '==', 'submitted').get();
     const updates = attemptsSnap.docs.map((doc) => {
       const attempt = doc.data();
       revealedCount += 1;
+      revealedStudentUids.push(attempt.studentUid);
       return {
         ref: db.collection('studentAttempts').doc(attempt.studentUid).collection('records').doc(doc.id),
         data: { hidden: false, score: attempt.score, totalPoints: attempt.totalPoints },
@@ -470,6 +536,22 @@ app.post('/setExamPublishStatus', async (req, res) => {
   }
 
   res.status(200).json({ status: publish ? 'published' : 'closed', revealedCount });
+
+  if (revealedStudentUids.length > 0) {
+    try {
+      const usersSnap = await db.getAll(
+        ...revealedStudentUids.map((sUid) => db.collection('users').doc(sUid))
+      );
+      const tokens = usersSnap.flatMap((doc) => (doc.exists ? doc.data().fcmTokens || [] : []));
+      await sendPushToTokens(tokens, {
+        title: 'نتيجتك جاهزة',
+        body: `ظهرت نتيجتك في اختبار "${exam.title || exam.subject}"`,
+        data: { type: 'result_ready', examId },
+      });
+    } catch (e) {
+      console.error('setExamPublishStatus notification failed:', e);
+    }
+  }
 });
 
 // Detaches students from the caller's school (clears schoolNumber/stage/section)
@@ -1086,6 +1168,82 @@ app.post('/submitExamAttempt', async (req, res) => {
   } catch (error) {
     const status = error.httpStatus || 500;
     res.status(status).json({ error: error.message || 'Submission failed.' });
+  }
+});
+
+// The client creates the homework doc directly in Firestore, then calls this
+// to fan out a push notification — there's no Firestore-trigger layer on
+// this Express/Render backend, so notifications are always client-initiated.
+app.post('/notifyHomeworkCreated', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const homeworkId = req.body && req.body.homeworkId;
+  if (!homeworkId) {
+    res.status(400).json({ error: 'homeworkId is required.' });
+    return;
+  }
+
+  const homeworkSnap = await db.collection('homework').doc(homeworkId).get();
+  if (!homeworkSnap.exists) {
+    res.status(404).json({ error: 'Homework not found.' });
+    return;
+  }
+  const homework = homeworkSnap.data();
+  if (homework.teacherId !== uid) {
+    res.status(403).json({ error: 'Not the owner of this homework.' });
+    return;
+  }
+
+  res.status(200).json({ ok: true });
+
+  try {
+    const teacherSnap = await db.collection('users').doc(uid).get();
+    const schoolNumber = teacherSnap.exists ? teacherSnap.data().schoolNumber : '';
+    const tokens = await getStudentTokens({
+      schoolNumber,
+      stage: homework.stage,
+      sections: homework.sections,
+    });
+    await sendPushToTokens(tokens, {
+      title: 'واجب جديد',
+      body: `تم إضافة واجب جديد: "${homework.title}"`,
+      data: { type: 'homework_created', homeworkId },
+    });
+  } catch (e) {
+    console.error('notifyHomeworkCreated failed:', e);
+  }
+});
+
+app.post('/notifyHomeworkSubmitted', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const homeworkId = req.body && req.body.homeworkId;
+  if (!homeworkId) {
+    res.status(400).json({ error: 'homeworkId is required.' });
+    return;
+  }
+
+  const homeworkSnap = await db.collection('homework').doc(homeworkId).get();
+  if (!homeworkSnap.exists) {
+    res.status(404).json({ error: 'Homework not found.' });
+    return;
+  }
+  const homework = homeworkSnap.data();
+
+  res.status(200).json({ ok: true });
+
+  try {
+    const teacherSnap = await db.collection('users').doc(homework.teacherId).get();
+    const tokens = teacherSnap.exists ? teacherSnap.data().fcmTokens || [] : [];
+    await sendPushToTokens(tokens, {
+      title: 'تسليم واجب جديد',
+      body: `تم تسليم واجب "${homework.title}"`,
+      data: { type: 'homework_submitted', homeworkId },
+    });
+  } catch (e) {
+    console.error('notifyHomeworkSubmitted failed:', e);
   }
 });
 
