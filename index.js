@@ -717,6 +717,7 @@ app.post('/studentReports', async (req, res) => {
         attempts: [],
       };
       entry.attempts.push({
+        examId: examDoc.id,
         examTitle: exam.title || '',
         subject: exam.subject || '',
         score: data.score || 0,
