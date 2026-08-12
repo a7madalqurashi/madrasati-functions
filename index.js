@@ -168,7 +168,7 @@ app.post('/generateQuestions', async (req, res) => {
     res.status(403).json({ error: 'Not the owner of this exam.' });
     return;
   }
-  if (!exam.sourceFile || !exam.sourceFile.storagePath) {
+  if (!exam.sourceFile || !exam.sourceFile.url) {
     res.status(400).json({ error: 'Exam has no uploaded curriculum file.' });
     return;
   }
@@ -181,7 +181,11 @@ app.post('/generateQuestions', async (req, res) => {
   await examRef.update({ status: 'generating' });
 
   try {
-    const [fileBuffer] = await bucket.file(exam.sourceFile.storagePath).download();
+    const fileResponse = await fetch(exam.sourceFile.url);
+    if (!fileResponse.ok) {
+      throw new Error(`Failed to download curriculum file (${fileResponse.status}).`);
+    }
+    const fileBuffer = Buffer.from(await fileResponse.arrayBuffer());
     const text = await extractText(fileBuffer, exam.sourceFile.mimeType);
     const prompt = buildPrompt({ text, difficulty, trueFalseCount, multipleChoiceCount, language });
 
