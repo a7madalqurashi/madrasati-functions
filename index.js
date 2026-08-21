@@ -631,6 +631,151 @@ app.post('/removeStudentsFromSchool', async (req, res) => {
   res.status(200).json({ removedCount: snap.size });
 });
 
+async function requireTeacherWithSchool(req, res) {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return null;
+
+  const callerSnap = await db.collection('users').doc(uid).get();
+  if (!callerSnap.exists || callerSnap.data().role !== 'teacher') {
+    res.status(403).json({ error: 'Only teachers can perform this action.' });
+    return null;
+  }
+  const schoolNumber = String(callerSnap.data().schoolNumber || '').trim();
+  if (!schoolNumber) {
+    res.status(400).json({ error: 'Your account has no school number set.' });
+    return null;
+  }
+  return { uid, schoolNumber };
+}
+
+app.post('/getClassRoster', async (req, res) => {
+  const caller = await requireTeacherWithSchool(req, res);
+  if (!caller) return;
+
+  const stage = req.body && req.body.stage;
+  const section = req.body && req.body.section;
+  if (!stage || section === undefined || section === null) {
+    res.status(400).json({ error: 'stage and section are required.' });
+    return;
+  }
+
+  const snap = await db
+    .collection('users')
+    .where('role', '==', 'student')
+    .where('schoolNumber', '==', caller.schoolNumber)
+    .where('stage', '==', stage)
+    .where('section', '==', section)
+    .get();
+
+  const students = snap.docs.map((doc) => {
+    const u = doc.data();
+    const name = [u.firstName, u.fatherName, u.lastName].filter(Boolean).join(' ');
+    return { uid: doc.id, name, phone: u.phone || '' };
+  });
+  students.sort((a, b) => a.name.localeCompare(b.name, 'ar'));
+
+  res.status(200).json({ students });
+});
+
+app.post('/saveAttendance', async (req, res) => {
+  const caller = await requireTeacherWithSchool(req, res);
+  if (!caller) return;
+
+  const stage = req.body && req.body.stage;
+  const section = req.body && req.body.section;
+  const date = req.body && req.body.date;
+  const records = req.body && req.body.records;
+  if (!stage || section === undefined || section === null || !date || !Array.isArray(records)) {
+    res.status(400).json({ error: 'stage, section, date, and records are required.' });
+    return;
+  }
+
+  const existing = await db
+    .collection('attendance')
+    .where('schoolNumber', '==', caller.schoolNumber)
+    .where('stage', '==', stage)
+    .where('section', '==', section)
+    .where('date', '==', date)
+    .limit(1)
+    .get();
+
+  const data = {
+    teacherId: caller.uid,
+    schoolNumber: caller.schoolNumber,
+    stage,
+    section,
+    date,
+    records,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  if (existing.empty) {
+    await db.collection('attendance').add({ ...data, createdAt: admin.firestore.FieldValue.serverTimestamp() });
+  } else {
+    await existing.docs[0].ref.set(data, { merge: true });
+  }
+
+  res.status(200).json({ success: true });
+});
+
+app.post('/getAttendanceHistory', async (req, res) => {
+  const caller = await requireTeacherWithSchool(req, res);
+  if (!caller) return;
+
+  const stage = req.body && req.body.stage;
+  const section = req.body && req.body.section;
+  if (!stage || section === undefined || section === null) {
+    res.status(400).json({ error: 'stage and section are required.' });
+    return;
+  }
+
+  const snap = await db
+    .collection('attendance')
+    .where('schoolNumber', '==', caller.schoolNumber)
+    .where('stage', '==', stage)
+    .where('section', '==', section)
+    .get();
+
+  const days = snap.docs.map((doc) => {
+    const d = doc.data();
+    const records = Array.isArray(d.records) ? d.records : [];
+    const presentCount = records.filter((r) => r.present).length;
+    return { date: d.date, presentCount, totalCount: records.length };
+  });
+  days.sort((a, b) => (a.date < b.date ? 1 : -1));
+
+  res.status(200).json({ days });
+});
+
+app.post('/getAttendanceByDate', async (req, res) => {
+  const caller = await requireTeacherWithSchool(req, res);
+  if (!caller) return;
+
+  const stage = req.body && req.body.stage;
+  const section = req.body && req.body.section;
+  const date = req.body && req.body.date;
+  if (!stage || section === undefined || section === null || !date) {
+    res.status(400).json({ error: 'stage, section, and date are required.' });
+    return;
+  }
+
+  const snap = await db
+    .collection('attendance')
+    .where('schoolNumber', '==', caller.schoolNumber)
+    .where('stage', '==', stage)
+    .where('section', '==', section)
+    .where('date', '==', date)
+    .limit(1)
+    .get();
+
+  if (snap.empty) {
+    res.status(200).json({ records: null });
+    return;
+  }
+  const d = snap.docs[0].data();
+  res.status(200).json({ records: Array.isArray(d.records) ? d.records : [] });
+});
+
 app.post('/examReport', async (req, res) => {
   const uid = await verifyAuth(req, res);
   if (!uid) return;
