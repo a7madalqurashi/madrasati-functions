@@ -776,27 +776,34 @@ app.post('/getAttendanceByDate', async (req, res) => {
   res.status(200).json({ records: Array.isArray(d.records) ? d.records : [] });
 });
 
+function normalizeSchoolCode(raw) {
+  return String(raw || '').trim().toUpperCase().replace(/\s+/g, '');
+}
+
+app.post('/checkSchoolCodeAvailable', async (req, res) => {
+  const code = normalizeSchoolCode(req.body && req.body.code);
+  if (!code) {
+    res.status(400).json({ error: 'code is required.' });
+    return;
+  }
+  const existing = await db.collection('schools').doc(code).get();
+  res.status(200).json({ available: !existing.exists });
+});
+
 app.post('/registerSchool', async (req, res) => {
   const uid = await verifyAuth(req, res);
   if (!uid) return;
 
   const schoolName = ((req.body && req.body.schoolName) || '').trim();
-  if (!schoolName) {
-    res.status(400).json({ error: 'schoolName is required.' });
+  const code = normalizeSchoolCode(req.body && req.body.code);
+  if (!schoolName || !code) {
+    res.status(400).json({ error: 'schoolName and code are required.' });
     return;
   }
 
-  let code = null;
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const candidate = generateJoinCode();
-    const existing = await db.collection('schools').doc(candidate).get();
-    if (!existing.exists) {
-      code = candidate;
-      break;
-    }
-  }
-  if (!code) {
-    res.status(500).json({ error: 'Could not generate a unique school code.' });
+  const existing = await db.collection('schools').doc(code).get();
+  if (existing.exists) {
+    res.status(409).json({ error: 'This school code is already taken.' });
     return;
   }
 
