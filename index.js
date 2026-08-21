@@ -776,6 +776,98 @@ app.post('/getAttendanceByDate', async (req, res) => {
   res.status(200).json({ records: Array.isArray(d.records) ? d.records : [] });
 });
 
+app.post('/registerSchool', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const schoolName = ((req.body && req.body.schoolName) || '').trim();
+  if (!schoolName) {
+    res.status(400).json({ error: 'schoolName is required.' });
+    return;
+  }
+
+  let code = null;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const candidate = generateJoinCode();
+    const existing = await db.collection('schools').doc(candidate).get();
+    if (!existing.exists) {
+      code = candidate;
+      break;
+    }
+  }
+  if (!code) {
+    res.status(500).json({ error: 'Could not generate a unique school code.' });
+    return;
+  }
+
+  await db.collection('schools').doc(code).set({
+    code,
+    schoolName,
+    adminUid: uid,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await db.collection('users').doc(uid).set({ schoolNumber: code }, { merge: true });
+
+  res.status(200).json({ code });
+});
+
+app.post('/schoolReports', async (req, res) => {
+  const uid = await verifyAuth(req, res);
+  if (!uid) return;
+
+  const callerSnap = await db.collection('users').doc(uid).get();
+  if (!callerSnap.exists || callerSnap.data().role !== 'school') {
+    res.status(403).json({ error: 'Only school accounts can perform this action.' });
+    return;
+  }
+  const schoolCode = String(callerSnap.data().schoolNumber || '').trim();
+  if (!schoolCode) {
+    res.status(400).json({ error: 'Your school account has no code set.' });
+    return;
+  }
+
+  const teachersSnap = await db
+    .collection('users')
+    .where('role', '==', 'teacher')
+    .where('schoolNumber', '==', schoolCode)
+    .get();
+
+  const teachers = [];
+  for (const teacherDoc of teachersSnap.docs) {
+    const teacher = teacherDoc.data();
+    const teacherName = [teacher.firstName, teacher.fatherName, teacher.lastName].filter(Boolean).join(' ');
+
+    const examsSnap = await db.collection('exams').where('teacherId', '==', teacherDoc.id).get();
+    let examCount = 0;
+    let attemptCount = 0;
+    let totalScore = 0;
+    let totalPossible = 0;
+    for (const examDoc of examsSnap.docs) {
+      const attemptsSnap = await examDoc.ref.collection('attempts').where('status', '==', 'submitted').get();
+      if (attemptsSnap.empty) continue;
+      examCount += 1;
+      attemptsSnap.forEach((a) => {
+        const data = a.data();
+        attemptCount += 1;
+        totalScore += data.score || 0;
+        totalPossible += data.totalPoints || 0;
+      });
+    }
+
+    teachers.push({
+      teacherUid: teacherDoc.id,
+      teacherName,
+      examCount,
+      attemptCount,
+      averagePercent: totalPossible > 0 ? (totalScore / totalPossible) * 100 : 0,
+    });
+  }
+  teachers.sort((a, b) => a.teacherName.localeCompare(b.teacherName, 'ar'));
+
+  res.status(200).json({ teachers });
+});
+
 app.post('/examReport', async (req, res) => {
   const uid = await verifyAuth(req, res);
   if (!uid) return;
