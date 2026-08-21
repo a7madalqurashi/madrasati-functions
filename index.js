@@ -631,25 +631,25 @@ app.post('/removeStudentsFromSchool', async (req, res) => {
   res.status(200).json({ removedCount: snap.size });
 });
 
-async function requireTeacherWithSchool(req, res) {
+async function requireAccountWithSchool(req, res, allowedRoles) {
   const uid = await verifyAuth(req, res);
   if (!uid) return null;
 
   const callerSnap = await db.collection('users').doc(uid).get();
-  if (!callerSnap.exists || callerSnap.data().role !== 'teacher') {
-    res.status(403).json({ error: 'Only teachers can perform this action.' });
+  if (!callerSnap.exists || !allowedRoles.includes(callerSnap.data().role)) {
+    res.status(403).json({ error: 'Not authorized to perform this action.' });
     return null;
   }
   const schoolNumber = String(callerSnap.data().schoolNumber || '').trim();
   if (!schoolNumber) {
-    res.status(400).json({ error: 'Your account has no school number set.' });
+    res.status(400).json({ error: 'Your account has no school set.' });
     return null;
   }
-  return { uid, schoolNumber };
+  return { uid, schoolNumber, role: callerSnap.data().role };
 }
 
 app.post('/getClassRoster', async (req, res) => {
-  const caller = await requireTeacherWithSchool(req, res);
+  const caller = await requireAccountWithSchool(req, res, ['teacher', 'school']);
   if (!caller) return;
 
   const stage = req.body && req.body.stage;
@@ -678,7 +678,7 @@ app.post('/getClassRoster', async (req, res) => {
 });
 
 app.post('/saveAttendance', async (req, res) => {
-  const caller = await requireTeacherWithSchool(req, res);
+  const caller = await requireAccountWithSchool(req, res, ['teacher']);
   if (!caller) return;
 
   const stage = req.body && req.body.stage;
@@ -719,7 +719,7 @@ app.post('/saveAttendance', async (req, res) => {
 });
 
 app.post('/getAttendanceHistory', async (req, res) => {
-  const caller = await requireTeacherWithSchool(req, res);
+  const caller = await requireAccountWithSchool(req, res, ['teacher', 'school']);
   if (!caller) return;
 
   const stage = req.body && req.body.stage;
@@ -748,7 +748,7 @@ app.post('/getAttendanceHistory', async (req, res) => {
 });
 
 app.post('/getAttendanceByDate', async (req, res) => {
-  const caller = await requireTeacherWithSchool(req, res);
+  const caller = await requireAccountWithSchool(req, res, ['teacher', 'school']);
   if (!caller) return;
 
   const stage = req.body && req.body.stage;
@@ -820,19 +820,9 @@ app.post('/registerSchool', async (req, res) => {
 });
 
 app.post('/schoolReports', async (req, res) => {
-  const uid = await verifyAuth(req, res);
-  if (!uid) return;
-
-  const callerSnap = await db.collection('users').doc(uid).get();
-  if (!callerSnap.exists || callerSnap.data().role !== 'school') {
-    res.status(403).json({ error: 'Only school accounts can perform this action.' });
-    return;
-  }
-  const schoolCode = String(callerSnap.data().schoolNumber || '').trim();
-  if (!schoolCode) {
-    res.status(400).json({ error: 'Your school account has no code set.' });
-    return;
-  }
+  const caller = await requireAccountWithSchool(req, res, ['school']);
+  if (!caller) return;
+  const schoolCode = caller.schoolNumber;
 
   const teachersSnap = await db
     .collection('users')
@@ -873,6 +863,108 @@ app.post('/schoolReports', async (req, res) => {
   teachers.sort((a, b) => a.teacherName.localeCompare(b.teacherName, 'ar'));
 
   res.status(200).json({ teachers });
+});
+
+app.post('/getSchoolTeachers', async (req, res) => {
+  const caller = await requireAccountWithSchool(req, res, ['school']);
+  if (!caller) return;
+
+  const snap = await db
+    .collection('users')
+    .where('role', '==', 'teacher')
+    .where('schoolNumber', '==', caller.schoolNumber)
+    .get();
+
+  const teachers = snap.docs.map((doc) => {
+    const u = doc.data();
+    const name = [u.firstName, u.fatherName, u.lastName].filter(Boolean).join(' ');
+    return { uid: doc.id, name, phone: u.phone || '' };
+  });
+  teachers.sort((a, b) => a.name.localeCompare(b.name, 'ar'));
+
+  res.status(200).json({ teachers });
+});
+
+app.post('/getSchoolStudents', async (req, res) => {
+  const caller = await requireAccountWithSchool(req, res, ['school']);
+  if (!caller) return;
+
+  const snap = await db
+    .collection('users')
+    .where('role', '==', 'student')
+    .where('schoolNumber', '==', caller.schoolNumber)
+    .get();
+
+  const students = snap.docs.map((doc) => {
+    const u = doc.data();
+    const name = [u.firstName, u.fatherName, u.lastName].filter(Boolean).join(' ');
+    return {
+      uid: doc.id,
+      name,
+      phone: u.phone || '',
+      stage: u.stage || '',
+      section: u.section ?? null,
+    };
+  });
+  students.sort((a, b) => a.name.localeCompare(b.name, 'ar'));
+
+  res.status(200).json({ students });
+});
+
+app.post('/schoolStudentReports', async (req, res) => {
+  const caller = await requireAccountWithSchool(req, res, ['school']);
+  if (!caller) return;
+
+  const teachersSnap = await db
+    .collection('users')
+    .where('role', '==', 'teacher')
+    .where('schoolNumber', '==', caller.schoolNumber)
+    .get();
+
+  const byStudent = new Map();
+  for (const teacherDoc of teachersSnap.docs) {
+    const examsSnap = await db.collection('exams').where('teacherId', '==', teacherDoc.id).get();
+    for (const examDoc of examsSnap.docs) {
+      const attemptsSnap = await examDoc.ref.collection('attempts').where('status', '==', 'submitted').get();
+      attemptsSnap.forEach((a) => {
+        const data = a.data();
+        if (!data.studentUid) return;
+        const entry = byStudent.get(data.studentUid) || {
+          studentUid: data.studentUid,
+          name: data.studentDisplayName || '',
+          examCount: 0,
+          totalScore: 0,
+          totalPossible: 0,
+        };
+        entry.examCount += 1;
+        entry.totalScore += data.score || 0;
+        entry.totalPossible += data.totalPoints || 0;
+        byStudent.set(data.studentUid, entry);
+      });
+    }
+  }
+
+  const students = [];
+  for (const entry of byStudent.values()) {
+    let stage = '';
+    let section = null;
+    const userSnap = await db.collection('users').doc(entry.studentUid).get();
+    if (userSnap.exists) {
+      stage = userSnap.data().stage || '';
+      section = userSnap.data().section ?? null;
+    }
+    students.push({
+      studentUid: entry.studentUid,
+      name: entry.name,
+      stage,
+      section,
+      examCount: entry.examCount,
+      averagePercent: entry.totalPossible > 0 ? (entry.totalScore / entry.totalPossible) * 100 : 0,
+    });
+  }
+  students.sort((a, b) => a.name.localeCompare(b.name, 'ar'));
+
+  res.status(200).json({ students });
 });
 
 app.post('/examReport', async (req, res) => {
